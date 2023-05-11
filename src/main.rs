@@ -1,8 +1,9 @@
 use anyhow::Context;
 use clap::Parser;
 use laby::{html, iter, render};
+use lychee_lib::Response;
 use serde::{Deserialize, Serialize};
-use std::{fs::File, io::BufReader, path::PathBuf};
+use std::{fs::File, io::BufReader, path::PathBuf, process};
 
 #[derive(Debug, Parser)]
 pub enum Action {
@@ -71,7 +72,8 @@ pub struct Manifest {
     songs: Vec<Song>,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let args = Arguments::parse();
     match args.action {
         Action::Generate { manifest, output } => {
@@ -84,12 +86,7 @@ fn main() -> anyhow::Result<()> {
                 laby::audio!(
                     class = "track",
                     controls = "controls",
-                    //type = "audio/mpeg",
-                    source!(
-                        src = {
-                            format!("{}{}", manifest.prefix, s.path.to_str().unwrap_or_default())
-                        }
-                    )
+                    source!(src = song_url(&manifest.prefix, s.path.to_str().unwrap_or_default()))
                 )
             )));
 
@@ -105,10 +102,30 @@ fn main() -> anyhow::Result<()> {
             let reader = BufReader::new(File::open(manifest).context("Failed to open manifest")?);
             let manifest: Manifest =
                 serde_json::from_reader(reader).context("Failed to read manifest")?;
-            for _song in manifest.songs {
-                todo!(
-                    "Use lychee lib or somesuch crate to check if file exists (but not download)"
-                );
+            let mut handles = Vec::new();
+            for song in manifest.songs {
+                let url = song_url(&manifest.prefix, song.path.to_str().unwrap_or_default());
+                let handle = tokio::spawn({
+                    println!("Checking {url}");
+                    lychee_lib::check(url)
+                });
+                handles.push(handle);
+            }
+            let responses = futures::future::try_join_all(handles)
+                .await
+                .context("Failed to join the check tasks")?
+                .into_iter()
+                .collect::<Result<Vec<Response>, _>>()
+                .context("Resource unreachable")?;
+            let mut error = false;
+            for response in responses {
+                if !response.status().is_success() {
+                    error = true;
+                    eprintln!("not reachable {}", response.0)
+                }
+            }
+            if error {
+                process::exit(1);
             }
         }
         Action::Add {
@@ -142,4 +159,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn song_url(prefix: &str, path: &str) -> String {
+    format!("{}{}", prefix, path)
 }
